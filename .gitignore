@@ -1,0 +1,10 @@
+# 密钥文件（绝不上传）
+.env
+config_local.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 报告输出
+reports/*.png
