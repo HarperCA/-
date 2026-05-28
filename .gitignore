@@ -1,0 +1,30 @@
+# Secret files
+.env
+config_local.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local/runtime artifacts
+logs/
+*.log
+*.sqlite
+*.db
+cloudflared.exe
+
+# Generated market data and user state
+data/cache/
+data/cleaned/
+data/userspace/
+data/shared_reports/
+data/*.json
+data/.session_secret
+portfolio.json
+analyze_*.txt
+
+# Generated reports/exports
+reports/**
+!reports/
+!reports/visualizer.py

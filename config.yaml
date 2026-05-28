@@ -1,0 +1,45 @@
+# 量化智能体全局配置
+# 建议把 API Key 放在 .env 文件中，参考 .env.example。
+
+# 大模型配置
+# 如果已经使用 .env，这里可以留空，程序会优先读取环境变量。
+llm:
+  provider: ""            # 可选：openai / deepseek / dashscope（通义）/ ollama
+  api_key: ""             # 建议留空，写入 .env 文件或系统环境变量
+  base_url: ""            # 自定义地址，例如 DeepSeek: https://api.deepseek.com
+  model: ""               # 模型名称，例如 gpt-4o-mini / deepseek-chat / qwen-max
+  temperature: 0.3        # 创造性温度，量化分析建议偏低
+
+# 市场数据源
+market:
+  default_symbol: "000001"    # 默认标的，例如平安银行
+  default_market: "a_stock"   # 可选：a_stock / fund / crypto / us_stock
+  data_source: "akshare"      # A 股使用 akshare，美股和加密货币使用 yfinance
+
+# 回测配置
+backtest:
+  initial_cash: 100000        # 初始资金
+  commission: 0.0003          # 手续费率，万分之三
+  slippage: 0.001             # 滑点
+
+# 基金配置：场外基金申购费率和赎回费率
+fund:
+  subscribe_fee: 0.001        # 申购费率，0.1%
+  redeem_fee_tiers:           # 赎回费率阶梯：持有天数 -> 费率
+    7: 0.015                  # 小于 7 天：1.5%
+    30: 0.0075                # 7 到 30 天：0.75%
+    365: 0.005                # 30 到 365 天：0.5%
+    999999: 0.0               # 大于 365 天：免费
+
+# 策略参数
+strategy:
+  fast_window: 10             # 快线周期
+  slow_window: 30             # 慢线周期
+  rsi_period: 14              # RSI 周期
+  rsi_overbought: 70          # RSI 超买线
+  rsi_oversold: 30            # RSI 超卖线
+
+# 输出配置
+output:
+  report_dir: "./reports"     # 报告输出目录
+  save_charts: true           # 是否保存图表
