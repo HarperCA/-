@@ -2,8 +2,13 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#11131f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="因果迷宫" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>因果迷宫 Demo 0</title>
+  <link rel="manifest" href="manifest.webmanifest" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -11,7 +16,7 @@
     <section class="hero">
       <p class="eyebrow">Causal Maze Demo 0</p>
       <h1>因果迷宫</h1>
-      <p class="subtitle">攻击不是为了单纯扣血，而是为了把敌人推到正确的位置。</p>
+      <p class="subtitle">手机竖屏策略原型：攻击不是单纯扣血，而是把敌人推到正确的位置。</p>
     </section>
 
     <section class="panel status-panel">
@@ -29,17 +34,12 @@
       </div>
     </section>
 
-    <section class="board-wrap">
-      <div id="board" class="board" aria-label="4x4 因果迷宫棋盘"></div>
+    <section class="tip-card">
+      <strong>操作：</strong>点击绿色高亮格移动；点击橙色高亮敌人攻击。敌人回合会追击你。
     </section>
 
-    <section class="panel rules-panel">
-      <h2>当前规则</h2>
-      <ul>
-        <li><strong>攻击会推人：</strong>攻击相邻敌人时，敌人会向攻击方向后退 1 格。</li>
-        <li><strong>撞墙伤害：</strong>敌人被推到墙或边界上时，额外受到 1 点伤害。</li>
-        <li><strong>死亡爆炸：</strong>敌人死亡时，对周围 8 格敌人造成 1 点伤害。</li>
-      </ul>
+    <section class="board-wrap">
+      <div id="board" class="board" aria-label="4x4 因果迷宫棋盘"></div>
     </section>
 
     <section class="controls">
@@ -50,8 +50,25 @@
       <h2>因果日志</h2>
       <ol id="log"></ol>
     </section>
+
+    <details class="panel rules-panel">
+      <summary>当前规则</summary>
+      <ul>
+        <li><strong>攻击会推人：</strong>攻击相邻敌人时，敌人会向攻击方向后退 1 格。</li>
+        <li><strong>撞墙伤害：</strong>敌人被推到墙或边界上时，额外受到 1 点伤害。</li>
+        <li><strong>死亡爆炸：</strong>敌人死亡时，对周围 8 格敌人造成 1 点伤害。</li>
+        <li><strong>敌人追击：</strong>玩家行动后，敌人会向玩家靠近；相邻时攻击玩家。</li>
+      </ul>
+    </details>
   </main>
 
   <script src="game.js"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>
