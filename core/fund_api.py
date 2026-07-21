@@ -80,6 +80,9 @@ def fetch_fund_nav(fund_code: str, period: str = "max") -> pd.DataFrame:
             break
         page += 1
 
+    if not all_records and period != "max":
+        return fetch_fund_nav(fund_code, "max")
+
     if not all_records:
         raise RuntimeError(f"未获取到基金 {fund_code} 的数据")
 

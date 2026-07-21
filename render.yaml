@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: quant-review-workbench
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: waitress-serve --host=0.0.0.0 --port=$PORT wsgi:app
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: BROKER_ENABLED
+        value: "false"
+      - key: BROKER_PROVIDER
+        value: "stub"
+

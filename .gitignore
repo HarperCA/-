@@ -28,8 +28,3 @@ analyze_*.txt
 reports/**
 !reports/
 !reports/visualizer.py
-
-# Keep already tracked report examples from the remote repository intact.
-!reports/sample_investment_review/
-!reports/sample_investment_review/*.md
-!reports/sample_investment_review/*.docx

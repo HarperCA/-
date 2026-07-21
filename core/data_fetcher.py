@@ -12,6 +12,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+INDEX_SYMBOLS = {"000300", "000905", "000016", "000852"}
+INDEX_YFINANCE_TICKERS = {
+    "000300": "000300.SS",
+    "000905": "000905.SS",
+    "000016": "000016.SS",
+    "000852": "000852.SS",
+}
+
 
 @contextmanager
 def _without_proxy():
@@ -94,7 +102,7 @@ class DataFetcher:
             else:
                 raise ValueError(f"不支持的市场类型: {market}")
         except Exception:
-            if cached is not None:
+            if cached is not None and not force_refresh:
                 print(f"   数据源暂不可用，使用旧缓存: {cache_path.name}")
                 return self._normalize_ohlcv(cached, symbol=symbol, market=market)
             raise
@@ -186,6 +194,13 @@ class DataFetcher:
             else:
                 symbol += ".SZ"
 
+        base_symbol = symbol.replace(".SH", "").replace(".SZ", "")
+        if base_symbol in INDEX_SYMBOLS:
+            try:
+                return self._fetch_a_index_yfinance(base_symbol, start_date, end_date, RuntimeError("yfinance index fallback unavailable"))
+            except Exception:
+                return self._fetch_a_index(base_symbol, start_date, end_date)
+
         last_error = None
         for attempt in range(3):
             try:
@@ -217,6 +232,59 @@ class DataFetcher:
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")
         df = df[["open", "high", "low", "close", "volume"]]
+        return df
+
+    def _fetch_a_index(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """通过 akshare 获取 A 股指数行情。"""
+        last_error = None
+        if hasattr(self.ak, "index_zh_a_hist"):
+            for attempt in range(3):
+                try:
+                    with _without_proxy():
+                        df = self.ak.index_zh_a_hist(
+                            symbol=symbol,
+                            period="daily",
+                            start_date=start_date,
+                            end_date=end_date,
+                        )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(0.8 * (attempt + 1))
+            else:
+                return self._fetch_a_index_yfinance(symbol, start_date, end_date, last_error)
+        else:
+            return self._fetch_a_index_yfinance(symbol, start_date, end_date, RuntimeError("当前 akshare 版本不支持 A 股指数历史行情接口"))
+
+        if df is None or df.empty:
+            return self._fetch_a_index_yfinance(symbol, start_date, end_date, RuntimeError(f"未获取到 A股指数 {symbol} 的数据"))
+        df = df.rename(columns={
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "成交量": "volume",
+        })
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+        return df[["open", "high", "low", "close", "volume"]]
+
+    def _fetch_a_index_yfinance(self, symbol: str, start_date: str, end_date: str, reason: Exception) -> pd.DataFrame:
+        """A 股指数备用源。Yahoo 对部分中证指数覆盖较浅，但可提供点位兜底。"""
+        ticker_symbol = INDEX_YFINANCE_TICKERS.get(symbol)
+        if not ticker_symbol:
+            raise RuntimeError(f"A股指数数据源连接失败: {reason}")
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(start=pd.to_datetime(start_date).strftime("%Y-%m-%d"), end=pd.to_datetime(end_date).strftime("%Y-%m-%d"), interval="1d")
+        if df is None or df.empty:
+            raise RuntimeError(f"A股指数数据源连接失败: {reason}")
+        df.index = df.index.tz_localize(None)
+        df.columns = [str(c).lower().replace("stock splits", "splits") for c in df.columns]
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
+        df = df[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "high", "low", "close"])
+        if df.empty:
+            raise RuntimeError(f"A股指数数据源连接失败: {reason}")
         return df
 
     def _fetch_yfinance(

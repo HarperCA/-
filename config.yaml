@@ -16,6 +16,14 @@ market:
   default_market: "a_stock"   # 可选：a_stock / fund / crypto / us_stock
   data_source: "akshare"      # A 股使用 akshare，美股和加密货币使用 yfinance
 
+# 券商行情接口：默认未启用。配置真实 provider/api_url/api_key 后，页面图表才允许展示券商数据。
+broker:
+  enabled: false
+  provider: "stub"
+  api_url: ""
+  api_key: ""
+  dry_run: true
+
 # 回测配置
 backtest:
   initial_cash: 100000        # 初始资金

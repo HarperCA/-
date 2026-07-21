@@ -1,114 +1,88 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
-"""
-AI 閲忓寲鏅鸿兘浣?- Web 鐗堝叆鍙?
-杩愯鏂瑰紡:
-    python web_app.py
-鐒跺悗鎵撳紑:
-    http://127.0.0.1:5000
-"""
 
 import io
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import sys
 import traceback
-import re
-import zipfile
-from datetime import datetime, timedelta
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import uuid4
 
-from flask import Flask, render_template_string, request, url_for, session, send_file
-from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
-from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
 
 from agent.quant_agent import QuantAgent
-from core.value_analysis import fetch_stock_value, format_value_report
-from core.holdings_manager import HoldingsManager
+from core.broker_adapter import BrokerAdapter
 from core.indicators import add_all_indicators, generate_signal_summary
-from core.market_report import MarketReportGenerator
-from core.storage import SQLiteDataStore
-from main import parse_natural_language_command
+from core.value_analysis import fetch_stock_value, format_value_report
 from reports.visualizer import ReportVisualizer
-from web_modules.automation import (
-    bounded_int as _bounded_int,
-    cleanup_old_files as _cleanup_old_files,
-    normalize_run_time as _normalize_run_time,
-    trim_json_list_file,
-)
-from web_modules.auth_routes import register_auth_routes
-from web_modules.exporting import export_rows_to_files as build_export_files
-from web_modules.forms import (
-    normalize_market as _normalize_market,
-    normalize_period as _normalize_period,
-    normalize_symbol as _normalize_symbol,
-    safe_export_stem,
-    safe_float as _safe_float,
-)
-from web_modules.main_routes import register_main_routes
-from web_modules.report_files import (
-    is_report_visible_to_user as report_visible_to_user,
-    list_recent_reports as build_recent_reports,
-    report_prefix_for_user,
-    to_image_url,
-)
-from web_modules.report_routes import register_report_routes
-from web_modules.research_report import build_report_from_analysis, save_report_bundle
-from web_modules.source_records import apply_data_breadth, record
-from web_modules.research_routes import register_research_routes
-from web_modules.system_routes import register_system_routes
-from web_modules import security as security_helpers
-from web_modules.security import (
-    clear_login_failures as _clear_login_failures,
-    hash_password as _hash_password,
-    is_valid_username as _is_valid_username,
-    legacy_hash_password as _legacy_hash_password,
-    login_blocked_until as _login_blocked_until,
-    parse_bounded_float as _parse_bounded_float,
-    record_login_failure as _record_login_failure,
-    safe_username as _safe_username,
-    validate_buy_date as _validate_buy_date,
-    validate_market as _validate_market,
-    validate_period as _validate_period,
-    verify_password as _verify_password,
-)
-from web_modules.templates import (
-    PAGE_TEMPLATE,
-    LOGIN_PAGE_TEMPLATE,
-    REGISTER_PAGE_TEMPLATE,
-    STRATEGY_PAGE_TEMPLATE,
-    HISTORY_PAGE_TEMPLATE,
-    BACKTEST_COMPARE_TEMPLATE,
-    CLEAN_STRATEGY_PAGE_TEMPLATE,
-    CLEAN_HISTORY_PAGE_TEMPLATE,
-    MARKET_REPORT_PAGE_TEMPLATE,
-    UI_CONCEPTS_TEMPLATE,
-)
-from scripts.refresh_max_history import discover_targets, refresh_target
+from web_modules.templates import PAGE_TEMPLATE
 
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORTS_DIR = BASE_DIR / "reports"
 DATA_DIR = BASE_DIR / "data"
 USERSPACE_DIR = DATA_DIR / "userspace"
-LEGACY_HISTORY_FILE = DATA_DIR / "analysis_history.json"
-LEGACY_HOLDINGS_FILE = DATA_DIR / "holdings.json"
-SQLITE_FILE = DATA_DIR / "quant_app.sqlite"
 SESSION_SECRET_FILE = DATA_DIR / ".session_secret"
 LOGS_DIR = BASE_DIR / "logs"
-LOGIN_FAILURE_LIMIT = security_helpers.LOGIN_FAILURE_LIMIT
-LOGIN_FAILURE_WINDOW = security_helpers.LOGIN_FAILURE_WINDOW
-LOGIN_LOCKOUT = security_helpers.LOGIN_LOCKOUT
-LOGIN_FAILURES = security_helpers.LOGIN_FAILURES
 
 app = Flask(__name__)
+
+INDEX_SYMBOL_NAMES = {
+    "沪深300": "000300",
+    "中证500": "000905",
+    "上证50": "000016",
+    "中证1000": "000852",
+}
+INDEX_SYMBOLS = set(INDEX_SYMBOL_NAMES.values())
+FUND_SYMBOL_NAMES = {
+    "广发纯债债券A": "270048",
+    "广发纳斯达克100ETF联接人民币(QDII)C": "006479",
+}
+INDEX_CODE_NAMES = {code: name for name, code in INDEX_SYMBOL_NAMES.items()}
+FUND_CODE_NAMES = {code: name for name, code in FUND_SYMBOL_NAMES.items()}
+MARKET_LABELS = {
+    "auto": "自动识别",
+    "fund": "基金",
+    "a_stock": "A股/指数",
+    "us_stock": "美股",
+    "crypto": "数字资产",
+}
+STOCK_CODE_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689")
+CN_INDEX_PROXY_SYMBOLS = {
+    "000300": "沪深300",
+    "000905": "中证500",
+    "000016": "上证50",
+    "000852": "中证1000",
+}
+FUND_VALUATION_PROXIES = (
+    ("沪深300价值", ("cn-index", "沪深300")),
+    ("沪深300", ("cn-index", "沪深300")),
+    ("中证500", ("cn-index", "中证500")),
+    ("上证50", ("cn-index", "上证50")),
+    ("中证1000", ("cn-index", "中证1000")),
+    ("红利低波", ("cn-index", "上证红利")),
+    ("纳斯达克100", ("us-etf", "QQQ")),
+    ("NASDAQ 100", ("us-etf", "QQQ")),
+    ("港股通互联网", ("us-etf", "PGJ")),
+)
+
+
+def _broker_data_ready() -> bool:
+    return broker_adapter.ready
+
+
+def _broker_data_source_label() -> str:
+    return broker_adapter.label
 
 
 def _load_secret_key() -> str:
@@ -117,13 +91,9 @@ def _load_secret_key() -> str:
         return env_secret
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if SESSION_SECRET_FILE.exists():
-        try:
-            secret = SESSION_SECRET_FILE.read_text(encoding="utf-8").strip()
-            if secret:
-                return secret
-        except Exception:
-            pass
-    import secrets
+        secret = SESSION_SECRET_FILE.read_text(encoding="utf-8").strip()
+        if secret:
+            return secret
     secret = secrets.token_hex(32)
     SESSION_SECRET_FILE.write_text(secret, encoding="utf-8")
     return secret
@@ -144,27 +114,9 @@ app.logger.addHandler(file_handler)
 app.logger.setLevel(logging.INFO)
 
 agent = QuantAgent(config_path=str(BASE_DIR / "config.yaml"), paper_trade=False)
+broker_adapter = BrokerAdapter.from_config(agent.config.get("broker", {}))
 visualizer = ReportVisualizer(output_dir=str(REPORTS_DIR))
-market_reporter = MarketReportGenerator()
-scheduler = BackgroundScheduler(
-    timezone="Asia/Shanghai",
-    job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300},
-)
-sqlite_store = SQLiteDataStore(SQLITE_FILE)
 
-USERS_FILE = DATA_DIR / "users.json"
-
-def _load_users() -> dict:
-    if USERS_FILE.exists():
-        try:
-            return json.loads(USERS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def _save_users(users: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def _csrf_token() -> str:
     token = session.get("csrf_token")
@@ -214,12 +166,18 @@ def _add_security_headers(response):
     return response
 
 
-def _current_user() -> str | None:
-    return session.get("username")
+def _safe_username(username: str | None) -> str:
+    base = (username or "guest").strip()
+    base = re.sub(r"[^0-9A-Za-z_\-]+", "_", base)
+    return base or "guest"
 
 
-def _user_dir(username: str | None) -> Path:
-    path = USERSPACE_DIR / _safe_username(username)
+def _current_user() -> str:
+    return _safe_username(session.get("username") or "guest")
+
+
+def _user_dir(username: str | None = None) -> Path:
+    path = USERSPACE_DIR / _safe_username(username or _current_user())
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -228,253 +186,452 @@ def _user_file(username: str | None, name: str) -> Path:
     return _user_dir(username) / name
 
 
-def _tag_rows_with_username(rows: list[dict], username: str | None) -> list[dict]:
-    safe_username = _safe_username(username)
-    tagged = []
-    for row in rows or []:
-        item = dict(row or {})
-        item.setdefault("username", safe_username)
-        tagged.append(item)
-    return tagged
-
-
-def _ensure_user_space(username: str | None) -> None:
-    if not username:
-        return
-    user_dir = _user_dir(username)
-    holdings_file = user_dir / "holdings.json"
-    history_file = user_dir / "analysis_history.json"
-    alerts_file = user_dir / "alerts.json"
-    automation_file = user_dir / "automations.json"
-    notifications_file = user_dir / "notifications.json"
-
-    if not holdings_file.exists() and LEGACY_HOLDINGS_FILE.exists():
-        try:
-            legacy = json.loads(LEGACY_HOLDINGS_FILE.read_text(encoding="utf-8"))
-            if isinstance(legacy, list):
-                holdings_file.write_text(json.dumps({_safe_username(username): _tag_rows_with_username(legacy, username)}, ensure_ascii=False, indent=2), encoding="utf-8")
-            elif isinstance(legacy, dict) and legacy and all(isinstance(v, list) for v in legacy.values()):
-                safe_username = _safe_username(username)
-                if username in legacy:
-                    holdings_file.write_text(json.dumps({safe_username: _tag_rows_with_username(legacy.get(username, []), username)}, ensure_ascii=False, indent=2), encoding="utf-8")
-                elif safe_username in legacy:
-                    holdings_file.write_text(json.dumps({safe_username: _tag_rows_with_username(legacy.get(safe_username, []), username)}, ensure_ascii=False, indent=2), encoding="utf-8")
-                elif len(legacy) == 1:
-                    only_key = next(iter(legacy))
-                    holdings_file.write_text(json.dumps({safe_username: _tag_rows_with_username(legacy.get(only_key, []), username)}, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-    if not history_file.exists() and LEGACY_HISTORY_FILE.exists():
-        try:
-            legacy_history = json.loads(LEGACY_HISTORY_FILE.read_text(encoding="utf-8"))
-            if isinstance(legacy_history, list):
-                history_file.write_text(json.dumps(_tag_rows_with_username(legacy_history, username), ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-    for file_path, default_value in (
-        (alerts_file, []),
-        (automation_file, []),
-        (notifications_file, []),
-    ):
-        if not file_path.exists():
-            file_path.write_text(json.dumps(default_value, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _current_holdings_mgr() -> HoldingsManager:
-    username = _current_user()
-    _ensure_user_space(username)
-    return HoldingsManager(filepath=str(_user_file(username, "holdings.json")), username=_safe_username(username))
-
-
 def _read_json_file(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-
-def _write_json_file(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _sync_sqlite_dataset(username: str | None, dataset: str, rows: list[dict]) -> None:
-    if not username:
-        return
-    try:
-        sqlite_store.replace_dataset(_safe_username(username), dataset, rows)
-    except Exception:
-        pass
-
-
-def _sync_sqlite_user_data(username: str | None) -> None:
-    if not username:
-        return
-    safe_username = _safe_username(username)
-    try:
-        mgr = HoldingsManager(filepath=str(_user_file(username, "holdings.json")), username=safe_username)
-        _sync_sqlite_dataset(username, "holdings", [h.__dict__ for h in mgr.list_all()])
-        _sync_sqlite_dataset(username, "history", _read_history(username=username, limit=1000))
-        _sync_sqlite_dataset(username, "alerts", _read_alerts(username=username))
-        _sync_sqlite_dataset(username, "automations", _read_automations(username=username))
-    except Exception:
-        pass
-
-
-
-
-
-
-
-
-ECONOMIC_HISTORY_EVENTS = [
-    {
-        "year": "1630s",
-        "title": "Dutch Tulip Mania",
-        "summary": "A classic early asset bubble driven by scarcity, leverage-like promises and fast sentiment reversal.",
-        "tags": ["bubble", "speculation", "sentiment"],
-    },
-    {
-        "year": "1720",
-        "title": "South Sea Bubble",
-        "summary": "Debt restructuring narratives and equity speculation ended in a crash that reshaped British financial regulation.",
-        "tags": ["credit", "regulation", "equity"],
-    },
-    {
-        "year": "1929-1933",
-        "title": "Great Depression",
-        "summary": "Equity collapse, bank failures and demand contraction pushed modern fiscal, monetary and market regulation forward.",
-        "tags": ["crash", "banks", "policy"],
-    },
-    {
-        "year": "1970s",
-        "title": "Stagflation Shock",
-        "summary": "Oil shocks and inflation changed the way markets priced rates, commodities and real growth risk.",
-        "tags": ["inflation", "oil", "rates"],
-    },
-    {
-        "year": "1997-1998",
-        "title": "Asian Financial Crisis",
-        "summary": "Currency pegs, foreign debt and liquidity stress created a regional crisis with lasting lessons for FX risk.",
-        "tags": ["currency", "liquidity", "Asia"],
-    },
-    {
-        "year": "2000-2002",
-        "title": "Dot-com Bust",
-        "summary": "Internet growth expectations detached from cash flow, then valuations compressed sharply after funding conditions changed.",
-        "tags": ["technology", "valuation", "growth"],
-    },
-    {
-        "year": "2008",
-        "title": "Global Financial Crisis",
-        "summary": "Housing leverage, securitization and banking fragility triggered a systemic crisis and a new era of central-bank intervention.",
-        "tags": ["housing", "banks", "systemic risk"],
-    },
-    {
-        "year": "2020",
-        "title": "Pandemic Market Shock",
-        "summary": "A sudden stop in activity caused a liquidity shock, followed by aggressive policy support and a rapid risk-asset rebound.",
-        "tags": ["pandemic", "liquidity", "policy"],
-    },
-]
-
-
-VALUATION_METRICS = [
-    {"label": "市盈率", "value": "PE", "description": "用价格与盈利对比估值，适合盈利稳定的公司。"},
-    {"label": "市净率", "value": "PB", "description": "用价格与净资产对比估值，常用于银行、保险和周期行业。"},
-    {"label": "市销率", "value": "PS", "description": "用价格与收入对比估值，适合利润尚未稳定的成长型公司。"},
-    {"label": "现金流收益率", "value": "FCF Yield", "description": "用自由现金流衡量资产产生真金白银的能力。"},
-]
-
-
-def _to_image_url(path_str: str | None) -> str | None:
-    if not path_str:
-        return None
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = (BASE_DIR / path).resolve()
     if not path.exists():
-        return None
+        return default
     try:
-        rel_name = path.relative_to(REPORTS_DIR).as_posix()
-    except ValueError:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data
+    except Exception:
+        return default
+
+
+def _write_json_file(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _default_form() -> dict:
+    return {
+        "prompt": "",
+        "symbol": "002982",
+        "market": "auto",
+        "period": "max",
+        "start_date": "",
+        "end_date": "",
+        "use_ai": False,
+        "reader_version": "个人投资者版",
+    }
+
+
+def _normalize_market(value: str | None) -> str:
+    market = (value or "auto").strip()
+    return market if market in {"auto", "fund", "a_stock", "us_stock", "crypto"} else "auto"
+
+
+def _normalize_period(value: str | None) -> str:
+    period = (value or "max").strip()
+    allowed = {"1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "10y", "20y", "50y", "max"}
+    return period if period in allowed else "max"
+
+
+def _normalize_symbol(symbol: str, market: str) -> str:
+    symbol = (symbol or "").strip()
+    if market in ("auto", "fund", "a_stock") and symbol.isdigit():
+        return symbol.zfill(6)
+    return symbol.upper() if market in ("us_stock", "crypto") else symbol
+
+
+def _resolve_search_symbol(symbol: str, market: str) -> tuple[str, str]:
+    raw = (symbol or "").strip()
+    if raw in INDEX_SYMBOL_NAMES:
+        return INDEX_SYMBOL_NAMES[raw], "a_stock"
+    if raw in FUND_SYMBOL_NAMES:
+        return FUND_SYMBOL_NAMES[raw], "fund"
+    normalized = _normalize_symbol(raw, market)
+    if normalized in INDEX_SYMBOLS:
+        return normalized, "a_stock"
+    if market == "auto":
+        if normalized.isdigit() and len(normalized) == 6:
+            return normalized, "a_stock" if normalized.startswith(STOCK_CODE_PREFIXES) else "fund"
+        if re.fullmatch(r"[A-Za-z]{1,10}(?:[-.][A-Za-z]{1,10})?", normalized):
+            return normalized, "us_stock"
+    return normalized, market
+
+
+def _safe_float(value, digits: int = 4) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if number != number:
+        return "-"
+    return f"{number:.{digits}f}"
+
+
+def _safe_pct(value, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if number != number:
+        return "-"
+    return f"{number * 100:.{digits}f}%"
+
+
+def _display_percent(value, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number != number:
+        return ""
+    if abs(number) < 1:
+        number *= 100
+    return f"{number:.{digits}f}%"
+
+
+def _display_ratio(value, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number != number:
+        return ""
+    return f"{number:.{digits}f}"
+
+
+def _display_security_name(symbol: str, market: str, valuation: dict | None = None) -> str:
+    valuation = valuation or {}
+    name = (valuation.get("name") or "").strip()
+    if name and name != symbol:
+        return name
+    if market == "a_stock" and symbol in INDEX_CODE_NAMES:
+        return INDEX_CODE_NAMES[symbol]
+    if market == "fund" and symbol in FUND_CODE_NAMES:
+        return FUND_CODE_NAMES[symbol]
+    return symbol
+
+
+@lru_cache(maxsize=32)
+def _fetch_cn_index_proxy(index_name: str) -> dict:
+    try:
+        import akshare as ak
+
+        pe_df = ak.stock_index_pe_lg(symbol=index_name)
+        pb_df = ak.stock_index_pb_lg(symbol=index_name)
+        pe_value = None
+        pb_value = None
+        if pe_df is not None and not pe_df.empty:
+            latest = pe_df.iloc[-1]
+            pe_value = latest.get("滚动市盈率") or latest.get("静态市盈率")
+        if pb_df is not None and not pb_df.empty:
+            latest = pb_df.iloc[-1]
+            pb_value = latest.get("市净率")
+        return {
+            "pe": _display_ratio(pe_value),
+            "pb": _display_ratio(pb_value),
+            "source": f"{index_name}指数估值",
+        }
+    except Exception:
+        return {"pe": "", "pb": "", "source": ""}
+
+
+@lru_cache(maxsize=16)
+def _fetch_us_etf_proxy(ticker: str) -> dict:
+    try:
+        import yfinance as yf
+
+        info = yf.Ticker(ticker).info or {}
+        pe_value = info.get("trailingPE") or info.get("forwardPE")
+        pb_value = info.get("priceToBook")
+        short_name = info.get("shortName") or ticker
+        return {
+            "pe": _display_ratio(pe_value),
+            "pb": _display_ratio(pb_value),
+            "source": f"{short_name}代理估值",
+        }
+    except Exception:
+        return {"pe": "", "pb": "", "source": ""}
+
+
+def _infer_proxy_valuation(symbol: str, market: str, valuation: dict | None = None) -> dict:
+    valuation = valuation or {}
+    name = _display_security_name(symbol, market, valuation)
+    if market == "a_stock" and symbol in CN_INDEX_PROXY_SYMBOLS:
+        return _fetch_cn_index_proxy(CN_INDEX_PROXY_SYMBOLS[symbol])
+    if market == "fund":
+        upper_name = name.upper()
+        for keyword, (proxy_type, proxy_symbol) in FUND_VALUATION_PROXIES:
+            matched = keyword in upper_name if keyword.isascii() else keyword in name
+            if not matched:
+                continue
+            if proxy_type == "cn-index":
+                return _fetch_cn_index_proxy(proxy_symbol)
+            if proxy_type == "us-etf":
+                return _fetch_us_etf_proxy(proxy_symbol)
+    return {"pe": "", "pb": "", "source": ""}
+
+
+def _watchlist_valuation_payload(symbol: str, market: str, valuation: dict | None, summary: dict | None = None) -> dict:
+    valuation = valuation or {}
+    summary = summary or {}
+    pe_raw = valuation.get("pe_trailing") or valuation.get("pe_forward") or valuation.get("pe")
+    pb_raw = valuation.get("pb")
+    dividend_raw = valuation.get("dividend_yield")
+    roe_raw = valuation.get("roe")
+    pe = _display_ratio(pe_raw)
+    pb = _display_ratio(pb_raw)
+    valuation_note = ""
+    if not pe or not pb:
+        proxy = _infer_proxy_valuation(symbol, market, valuation)
+        if not pe:
+            pe = proxy.get("pe", "")
+        if not pb:
+            pb = proxy.get("pb", "")
+        valuation_note = proxy.get("source", "")
+    dividend = _display_percent(dividend_raw)
+    roe = _display_percent(roe_raw)
+    earnings_yield = ""
+    try:
+        pe_number = float(pe_raw)
+        if pe_number > 0:
+            earnings_yield = f"{100 / pe_number:.2f}%"
+    except (TypeError, ValueError):
+        pass
+
+    def _parse_percent(value: str | None):
+        if value in (None, "", "-"):
+            return None
+        try:
+            return float(str(value).replace("%", "").strip())
+        except ValueError:
+            return None
+
+    def _market_observation() -> tuple[str, str]:
+        rsi_value = _parse_percent(summary.get("rsi"))
+        position_value = _parse_percent(summary.get("position"))
+        drawdown_value = _parse_percent(summary.get("drawdown"))
+        ma20_value = summary.get("ma20")
+        ma60_value = summary.get("ma60")
+
+        try:
+            ma20_num = float(ma20_value)
+            ma60_num = float(ma60_value)
+        except (TypeError, ValueError):
+            ma20_num = ma60_num = None
+
+        if rsi_value is not None and rsi_value <= 30:
+            return "接近超卖", "status-high"
+        if rsi_value is not None and rsi_value >= 70:
+            return "短线过热", "status-high"
+        if drawdown_value is not None and drawdown_value <= -10:
+            return "回撤较深", "status-high"
+        if position_value is not None and position_value >= 80 and drawdown_value is not None and drawdown_value < 0:
+            return "高位回撤", "status-normal"
+        if position_value is not None and position_value <= 20:
+            return "低位观察", "status-low"
+        if ma20_num is not None and ma60_num is not None:
+            if ma20_num > ma60_num:
+                return "趋势偏强", "status-low"
+            if ma20_num < ma60_num:
+                return "趋势偏弱", "status-normal"
+        return "温和观察", "status-normal"
+
+    has_stock_metrics = any((pe, pb, dividend, roe))
+    is_index = market == "a_stock" and symbol in INDEX_SYMBOLS
+    if has_stock_metrics:
+        conclusion = "待复核"
+        status = "status-normal"
+        stars = "★★★☆☆"
+        metric_mode = "valuation"
+        try:
+            pe_number = float(pe_raw)
+            if pe_number > 0 and pe_number <= 15:
+                conclusion, status, stars = "估值偏低", "status-low", "★★★★☆"
+            elif pe_number >= 35:
+                conclusion, status, stars = "估值偏高", "status-high", "★★☆☆☆"
+        except (TypeError, ValueError):
+            pass
+        source = "structured-valuation"
+    else:
+        if market in ("fund", "a_stock"):
+            conclusion, status = _market_observation()
+        else:
+            conclusion, status = "数据不足", "status-normal"
+        stars = ""
+        source = "market-summary"
+        metric_mode = "market"
+
+    latest_value = (summary.get("buy_rows") or [{}])[0].get("value", "") if summary.get("buy_rows") else ""
+    latest_value_note = summary.get("data_end_note", "")
+    is_stale_market_data = bool(summary.get("is_stale_market_data"))
+
+    return {
+        "symbol": symbol,
+        "market": market,
+        "metricMode": metric_mode,
+        "name": _display_security_name(symbol, market, valuation),
+        "status": "status-normal" if (metric_mode == "market" and is_stale_market_data) else status,
+        "conclusion": "数据待更新" if (metric_mode == "market" and is_stale_market_data) else conclusion,
+        "stars": stars,
+        "earningsYield": earnings_yield,
+        "pe": pe,
+        "pb": pb,
+        "valuationNote": valuation_note,
+        "dividend": dividend,
+        "roe": roe,
+        "latestValue": latest_value,
+        "latestValueNote": latest_value_note,
+        "isStaleMarketData": is_stale_market_data,
+        "position": summary.get("position", ""),
+        "drawdown": summary.get("drawdown", ""),
+        "rsi": summary.get("rsi", ""),
+        "ma20": summary.get("ma20", ""),
+        "ma60": summary.get("ma60", ""),
+        "exchangeFund": symbol if market != "fund" else "",
+        "offExchangeFund": symbol if market == "fund" else "",
+        "valuationSource": source,
+    }
+
+
+def _json_number(value, digits: int = 4):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
         return None
-    return url_for("serve_report", filename=rel_name)
+    if number != number:
+        return None
+    return round(number, digits)
 
 
-def _report_prefix_for_user(username: str | None) -> str:
-    return f"{_safe_username(username) if username else 'guest'}_"
+def _result_unit_label(market: str, symbol: str) -> str:
+    if market == "fund":
+        return "单位净值"
+    if market == "a_stock" and symbol in INDEX_SYMBOLS:
+        return "当前点数"
+    return "当前价格"
 
 
-def _is_report_visible_to_user(filename: str, username: str | None) -> bool:
-    if not filename.endswith("_analysis.png"):
+def _is_stale_date(date_text: str, max_age_days: int = 45) -> bool:
+    try:
+        data_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except (TypeError, ValueError):
         return False
-    if "/" in filename or "\\" in filename:
+    return data_date < datetime.now() - timedelta(days=max_age_days)
+
+
+def _is_market_data_stale(date_text: str, max_age_days: int = 3) -> bool:
+    try:
+        data_date = datetime.strptime(date_text, "%Y-%m-%d")
+    except (TypeError, ValueError):
         return False
-    return filename.startswith(_report_prefix_for_user(username))
+    return data_date < datetime.now() - timedelta(days=max_age_days)
 
 
-def _list_recent_reports(limit: int = 8) -> list[dict]:
-    items = []
-    if not REPORTS_DIR.exists():
-        return items
-    username = _current_user()
-    prefix = _report_prefix_for_user(username)
-    visible_reports = [
-        path
-        for path in REPORTS_DIR.glob(f"{prefix}*_analysis.png")
-        if _is_report_visible_to_user(path.name, username)
+def _display_unit_label(market: str, symbol: str, data_end: str | None = None) -> str:
+    label = _result_unit_label(market, symbol)
+    if data_end and _is_stale_date(data_end):
+        return f"最后{label}"
+    return label
+
+
+def _build_search_summary(result: dict, df) -> dict:
+    symbol = result.get("symbol", "")
+    market = result.get("market", "")
+    latest = df.iloc[-1] if df is not None and not df.empty else {}
+    prev = df.iloc[-2] if df is not None and len(df) > 1 else latest
+    close = latest.get("close", "")
+    prev_close = prev.get("close", "")
+    change_pct = ""
+    try:
+        change_pct = (float(close) / float(prev_close) - 1) if float(prev_close) else ""
+    except (TypeError, ValueError, ZeroDivisionError):
+        change_pct = ""
+
+    ma20 = latest.get("MA20", "")
+    ma60 = latest.get("MA60", "")
+    rsi = latest.get("RSI", "")
+    recent = df.tail(min(len(df), 252)) if df is not None and not df.empty else df
+    high_252 = recent["close"].max() if recent is not None and not recent.empty else ""
+    low_252 = recent["close"].min() if recent is not None and not recent.empty else ""
+    drawdown = ""
+    position = ""
+    try:
+        close_float = float(close)
+        high_float = float(high_252)
+        low_float = float(low_252)
+        drawdown = close_float / high_float - 1 if high_float else ""
+        position = (close_float - low_float) / (high_float - low_float) if high_float != low_float else ""
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    if result.get("backtest") and getattr(result["backtest"], "total_return", None) is not None:
+        strategy_return = result["backtest"].total_return
+    else:
+        strategy_return = ""
+    if result.get("benchmark") and getattr(result["benchmark"], "total_return", None) is not None:
+        benchmark_return = result["benchmark"].total_return
+    else:
+        benchmark_return = ""
+
+    signal = result.get("signals", {})
+    data_end = df.index.max().strftime("%Y-%m-%d") if df is not None and not df.empty else ""
+    unit_label = _display_unit_label(market, symbol, data_end)
+    is_stale_market_data = bool(data_end and _is_market_data_stale(data_end))
+    stale_note = f"该标的最近数据截止 {data_end}，可能已终止、退市或数据源不再更新。" if data_end and _is_stale_date(data_end) else ""
+    data_end_note = f"截至 {data_end}" if data_end else ""
+    buy_rows = [
+        {"label": "当前值", "value": _safe_float(close), "note": unit_label},
+        {"label": "日变化", "value": _safe_pct(change_pct), "note": "最近两个交易日"},
+        {"label": "20日均线", "value": _safe_float(ma20), "note": "短中期趋势"},
+        {"label": "60日均线", "value": _safe_float(ma60), "note": "中期参照"},
+        {"label": "RSI", "value": _safe_float(rsi, 2), "note": "情绪温度"},
+        {"label": "近一年位置", "value": _safe_pct(position), "note": "越高越接近年内高位"},
+        {"label": "距近一年高点", "value": _safe_pct(drawdown), "note": "回撤幅度"},
+        {"label": "示例回测", "value": _safe_pct(strategy_return), "note": "均线规则，仅供复盘"},
+        {"label": "同期持有", "value": _safe_pct(benchmark_return), "note": "同区间参照"},
     ]
-    for path in sorted(visible_reports, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
-        symbol = path.stem.replace("_analysis", "").replace("_", "-")
-        items.append({
-            "label": f"{symbol} 鍒嗘瀽鍥捐〃",
-            "time": path.stat().st_mtime,
-            "url": _to_image_url(str(path)),
-        })
-    for item in items:
-        from datetime import datetime
-        item["time"] = datetime.fromtimestamp(item["time"]).strftime("%Y-%m-%d %H:%M")
-    return items
+    if stale_note:
+        evidence_note = stale_note
+    elif data_end:
+        evidence_note = f"图表已按本次获取的数据重绘，最后一条行情为 {data_end}。"
+    else:
+        evidence_note = "当前没有可用行情，先检查代码、市场类型或数据源。"
+    return {
+        "unit_label": unit_label,
+        "market_label": MARKET_LABELS.get(market, market),
+        "change_pct": _safe_pct(change_pct),
+        "ma20": _safe_float(ma20),
+        "ma60": _safe_float(ma60),
+        "rsi": _safe_float(rsi, 2),
+        "position": _safe_pct(position),
+        "drawdown": _safe_pct(drawdown),
+        "signal_text": "；".join(f"{k}: {v}" for k, v in signal.items()) or "暂无信号",
+        "stale_note": stale_note,
+        "is_stale_market_data": is_stale_market_data,
+        "data_end": data_end,
+        "data_end_note": data_end_note,
+        "evidence_note": evidence_note,
+        "buy_rows": buy_rows,
+    }
+
+
+def _normalize_backtest_date(value: str | None, field_name: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{field_name}必须是 YYYY-MM-DD 格式。") from exc
+
+
+def _friendly_error(exc: Exception) -> str:
+    message = str(exc).strip() or "操作失败"
+    if any(key in message for key in ("ProxyError", "Max retries exceeded", "HTTPSConnectionPool", "Unable to connect")):
+        return "数据源连接失败，通常是临时网络或代理问题。"
+    return f"操作失败：{message}"
 
 
 def _read_history(username: str | None = None, limit: int = 20) -> list[dict]:
-    username = username or _current_user()
-    if username:
-        _ensure_user_space(username)
-        history_file = _user_file(username, "analysis_history.json")
-        data = _read_json_file(history_file, [])
-        if isinstance(data, list):
-            return data[:limit]
-    items = []
-    for item in _list_recent_reports(limit):
-        symbol = item["label"].replace(" 鍒嗘瀽鍥捐〃", "")
-        items.append({
-            "time": item["time"],
-            "symbol": symbol,
-            "market": "",
-            "period": "",
-            "use_ai": False,
-            "latest_price": "-",
-            "analysis_image": item["url"],
-        })
-    return items
-
-
-def _cache_count() -> int:
-    cache_dir = DATA_DIR / "cache"
-    return len(list(cache_dir.glob("*.csv"))) if cache_dir.exists() else 0
+    data = _read_json_file(_user_file(username, "analysis_history.json"), [])
+    return data[:limit] if isinstance(data, list) else []
 
 
 def _write_history_item(item: dict, username: str | None = None, limit: int = 50) -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    _ensure_user_space(username)
     item = dict(item)
-    item["username"] = _safe_username(username)
+    item["username"] = _safe_username(username or _current_user())
     history = _read_history(username=username, limit=limit)
     deduped = [
         old for old in history
@@ -485,308 +642,18 @@ def _write_history_item(item: dict, username: str | None = None, limit: int = 50
             and old.get("use_ai") == item.get("use_ai")
         )
     ]
-    history = [item, *deduped][:limit]
-    _write_json_file(_user_file(username, "analysis_history.json"), history)
-    _sync_sqlite_dataset(username, "history", history)
+    _write_json_file(_user_file(username, "analysis_history.json"), [item, *deduped][:limit])
 
 
-def _read_alerts(username: str | None = None) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    _ensure_user_space(username)
-    data = _read_json_file(_user_file(username, "alerts.json"), [])
-    return data if isinstance(data, list) else []
-
-
-def _write_alerts(alerts: list[dict], username: str | None = None) -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    _ensure_user_space(username)
-    rows = _tag_rows_with_username(alerts, username)
-    _write_json_file(_user_file(username, "alerts.json"), rows)
-    _sync_sqlite_dataset(username, "alerts", rows)
-
-
-def _read_notifications(username: str | None = None) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    _ensure_user_space(username)
-    data = _read_json_file(_user_file(username, "notifications.json"), [])
-    return data if isinstance(data, list) else []
-
-
-def _write_notifications(items: list[dict], username: str | None = None) -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    _ensure_user_space(username)
-    _write_json_file(_user_file(username, "notifications.json"), items[:100])
-
-
-def _push_notification(message: str, username: str | None = None, level: str = "info") -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    items = _read_notifications(username=username)
-    items.insert(0, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "level": level,
-        "message": message,
-    })
-    _write_notifications(items, username=username)
-    webhook_url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
-    if webhook_url:
-        try:
-            import requests
-            requests.post(
-                webhook_url,
-                json={"username": _safe_username(username), "level": level, "message": message},
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-
-def _consume_notifications(username: str | None = None) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    items = _read_notifications(username=username)
-    _write_notifications([], username=username)
-    return items
-
-
-def _read_automations(username: str | None = None) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    _ensure_user_space(username)
-    data = _read_json_file(_user_file(username, "automations.json"), [])
-    return data if isinstance(data, list) else []
-
-
-def _write_automations(items: list[dict], username: str | None = None) -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    _ensure_user_space(username)
-    rows = _tag_rows_with_username(items, username)
-    _write_json_file(_user_file(username, "automations.json"), rows)
-    _sync_sqlite_dataset(username, "automations", rows)
-
-
-def _append_automation_log(username: str, item: dict) -> None:
-    log_file = _user_file(username, "automation_log.json")
-    data = _read_json_file(log_file, [])
-    if not isinstance(data, list):
-        data = []
-    data.insert(0, item)
-    _write_json_file(log_file, data[:100])
-    _sync_sqlite_dataset(username, "automation_log", data[:100])
-
-
-def _read_automation_log(username: str | None = None, limit: int = 20) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    data = _read_json_file(_user_file(username, "automation_log.json"), [])
-    return data[:limit] if isinstance(data, list) else []
-
-
-def _read_market_reports(username: str | None = None, limit: int = 20) -> list[dict]:
-    username = username or _current_user()
-    if not username:
-        return []
-    _ensure_user_space(username)
-    data = _read_json_file(_user_file(username, "market_reports.json"), [])
-    return data[:limit] if isinstance(data, list) else []
-
-
-def _write_market_reports(reports: list[dict], username: str | None = None) -> None:
-    username = username or _current_user()
-    if not username:
-        return
-    _ensure_user_space(username)
-    rows = _tag_rows_with_username(reports[:50], username)
-    _write_json_file(_user_file(username, "market_reports.json"), rows)
-    _sync_sqlite_dataset(username, "market_reports", rows)
-
-
-def _research_report_dir(username: str | None) -> Path:
-    path = _user_dir(username) / "research_reports"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _save_standard_research_report(report: dict, username: str | None = None) -> dict:
-    username = username or _current_user() or "guest"
-    paths = save_report_bundle(report, _research_report_dir(username))
-    return {key: str(value) for key, value in paths.items()}
-
-
-def _analysis_source_records(analysis_result: dict, username: str | None = None, data_breadth: str = "标准") -> list:
-    username = username or _current_user() or "guest"
-    base = [
-        record(
-            "analysis_result",
-            "系统分析结果",
-            f"{analysis_result.get('symbol', '-')} 分析输出",
-            fields=list(analysis_result.keys()),
-            used_for="收益计算 / 回撤分析 / 风险解释 / 报告生成",
-            reliability="medium",
-            notes="来自当前项目分析链路，包含行情计算、指标、回测曲线和图表路径。",
-        )
-    ]
-    return apply_data_breadth(
-        base,
-        breadth=data_breadth,
-        user_path=_user_dir(username),
-        reports_path=_research_report_dir(username),
-        db_path=DB_PATH,
-        cache_dir=DATA_DIR / "cache",
-        symbol=analysis_result.get("symbol"),
-        market=analysis_result.get("market"),
-        period=analysis_result.get("period"),
-        data_range=analysis_result.get("data_range"),
-    )
-
-
-def _upsert_automation_items(username: str, new_items: list[dict]) -> list[dict]:
-    ids = {item["id"] for item in new_items}
-    existing = [item for item in _read_automations(username=username) if item.get("id") not in ids]
-    merged = [*existing, *new_items]
-    _write_automations(merged, username=username)
-    _reload_user_jobs(username)
-    return merged
-
-
-def _run_market_report(username: str, report_type: str = "daily") -> dict:
-    username = _safe_username(username)
-    report_type = "weekly" if report_type == "weekly" else "daily"
-    report = market_reporter.generate(report_type=report_type)
-    reports = _read_market_reports(username=username, limit=50)
-    reports.insert(0, report)
-    _write_market_reports(reports, username=username)
-    _append_automation_log(username, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "type": f"market_{report_type}_report",
-        "summary": {
-            "environment": report.get("environment", {}).get("label"),
-            "score": report.get("environment", {}).get("score"),
-            "report_id": report.get("id"),
-        },
-    })
-    _push_notification(f"{report['title']}已生成：{report.get('environment', {}).get('label', '-')}", username=username, level="info")
-    return report
-
-
-def _trim_json_list_file(path: Path, limit: int) -> int:
-    return trim_json_list_file(path, limit, _read_json_file, _write_json_file)
-
-
-def _create_user_backup(username: str) -> str | None:
-    user_dir = _user_dir(username)
-    backup_dir = user_dir / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"{_safe_username(username)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    files = [
-        "alerts.json",
-        "analysis_history.json",
-        "automation_log.json",
-        "automations.json",
-        "holdings.json",
-        "market_reports.json",
-        "notifications.json",
-    ]
-    wrote_file = False
-    with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name in files:
-            path = user_dir / name
-            if path.exists():
-                archive.write(path, arcname=name)
-                wrote_file = True
-        if SQLITE_FILE.exists():
-            archive.write(SQLITE_FILE, arcname="quant_app.sqlite")
-            wrote_file = True
-    if not wrote_file:
-        backup_path.unlink(missing_ok=True)
+def _to_image_url(path_str: str | None) -> str | None:
+    if not path_str:
         return None
-    backups = sorted(backup_dir.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for old_backup in backups[10:]:
-        try:
-            old_backup.unlink()
-        except OSError:
-            continue
-    return str(backup_path.relative_to(BASE_DIR))
-
-
-def _run_system_maintenance(username: str) -> None:
-    username = _safe_username(username)
-    backup_path = _create_user_backup(username)
-    trimmed_logs = _trim_json_list_file(_user_file(username, "automation_log.json"), 100)
-    trimmed_notifications = _trim_json_list_file(_user_file(username, "notifications.json"), 100)
-    removed_cache = _cleanup_old_files(DATA_DIR / "cache", ("*.csv",), older_than_days=14)
-    removed_logs = _cleanup_old_files(BASE_DIR / "logs", ("*.log",), older_than_days=30)
-
-    enabled_jobs = [item for item in _read_automations(username=username) if item.get("enabled", True)]
-    scheduled_ids = {job.id for job in scheduler.get_jobs()}
-    missing_jobs = [
-        item.get("id", item.get("job_type", "unknown"))
-        for item in enabled_jobs
-        if f"{username}:{item.get('id')}" not in scheduled_ids
-    ]
-    if missing_jobs:
-        _reload_user_jobs(username)
-
-    summary = {
-        "backup": backup_path or "no_data",
-        "trimmed_logs": trimmed_logs,
-        "trimmed_notifications": trimmed_notifications,
-        "removed_cache_files": removed_cache,
-        "removed_log_files": removed_logs,
-        "reloaded_missing_jobs": missing_jobs,
-    }
-    _append_automation_log(username, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "type": "system_maintenance",
-        "summary": summary,
-    })
-    if missing_jobs:
-        _push_notification(f"自动维护已恢复任务：{', '.join(missing_jobs)}", username=username, level="alert")
-
-
-def _run_max_history_refresh(username: str) -> None:
-    targets = discover_targets([DATA_DIR / "cache", DATA_DIR / "cleaned"])
-    summary = []
-    for target in targets:
-        try:
-            _, rows, start, end = refresh_target(agent.data_fetcher, target, DATA_DIR / "cleaned")
-            summary.append({
-                "market": target.market,
-                "symbol": target.symbol,
-                "rows": rows,
-                "start": start,
-                "end": end,
-                "status": "ok",
-            })
-        except Exception as exc:
-            summary.append({
-                "market": target.market,
-                "symbol": target.symbol,
-                "status": "error",
-                "error": str(exc),
-            })
-    _append_automation_log(username, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "type": "max_history_refresh",
-        "summary": summary,
-    })
-    if summary:
-        ok_count = sum(1 for item in summary if item.get("status") == "ok")
-        _push_notification(f"最大历史数据刷新完成：{ok_count}/{len(summary)} 个标的成功。", username=username, level="info")
+    path = Path(path_str)
+    try:
+        rel_name = path.relative_to(REPORTS_DIR).as_posix()
+    except ValueError:
+        rel_name = path.name
+    return url_for("serve_report", filename=rel_name)
 
 
 def _validate_curve_points(points: list[dict], initial_cash: float, total_return: float, label: str) -> None:
@@ -804,7 +671,7 @@ def _validate_curve_points(points: list[dict], initial_cash: float, total_return
 def _stock_fundamental_fallback(symbol: str, market: str, period: str, error: Exception, use_ai: bool, username: str | None = None) -> dict:
     buffer = io.StringIO()
     with redirect_stdout(buffer):
-        print("\nMarket price data is temporarily unavailable; using fundamental fallback mode.")
+        print("Market price data is temporarily unavailable; using fundamental fallback mode.")
         print(f"Reason: {_friendly_error(error)}")
         val_data = None
         try:
@@ -814,48 +681,55 @@ def _stock_fundamental_fallback(symbol: str, market: str, period: str, error: Ex
         if val_data:
             print(format_value_report(val_data))
         else:
-            print(format_value_report({
-                "market": market,
-                "symbol": symbol,
-                "name": symbol,
-            }))
+            print(format_value_report({"market": market, "symbol": symbol, "name": symbol}))
         print(agent._format_cross_asset_valuation(market, val_data))
-        print("\nTechnical chart and backtest are unavailable until market data recovers.")
+        print("Technical chart and backtest are unavailable until market data recovers.")
 
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     analysis_result = {
         "symbol": symbol,
         "market": market,
+        "market_label": MARKET_LABELS.get(market, market),
+        "unit_label": _result_unit_label(market, symbol),
         "period": period,
         "latest_price": "",
         "data_range": "market data unavailable",
         "data_points": 0,
+        "generated_at": now,
         "log": buffer.getvalue(),
         "analysis_image": None,
         "equity_image": None,
         "equity_points": [],
         "benchmark_points": [],
+        "history_points": [],
+        "valuation": val_data or {},
+        "display_name": _display_security_name(symbol, market, val_data),
+        "summary": {
+            "unit_label": _result_unit_label(market, symbol),
+            "market_label": MARKET_LABELS.get(market, market),
+            "change_pct": "-",
+            "ma20": "-",
+            "ma60": "-",
+            "rsi": "-",
+            "position": "-",
+            "drawdown": "-",
+            "signal_text": "价格数据暂不可用",
+            "stale_note": "",
+            "buy_rows": [],
+        },
     }
-    standard_report = build_report_from_analysis(
-        analysis_result,
-        source_records=_analysis_source_records(analysis_result, username=username or _current_user()),
-    )
-    _save_standard_research_report(standard_report, username=username or _current_user())
-    analysis_result["standard_report_id"] = standard_report["id"]
-    analysis_result["standard_report_url"] = "/research_report"
-
-    from datetime import datetime
+    analysis_result["watchlist_item"] = _watchlist_valuation_payload(symbol, market, val_data, analysis_result["summary"])
     _write_history_item({
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "symbol": analysis_result["symbol"],
-        "market": analysis_result["market"],
-        "period": analysis_result["period"],
+        "time": now[:16],
+        "symbol": symbol,
+        "market": market,
+        "period": period,
         "use_ai": bool(use_ai),
         "latest_price": "-",
         "data_range": analysis_result["data_range"],
-        "data_points": analysis_result["data_points"],
+        "data_points": 0,
         "analysis_image": None,
-        "standard_report_id": analysis_result["standard_report_id"],
-    }, username=username or _current_user())
+    }, username=username)
     return analysis_result
 
 
@@ -871,8 +745,9 @@ def _run_analysis(
 ) -> dict:
     username = username or _current_user()
     buffer = io.StringIO()
-    equity_points = []
-    benchmark_points = []
+    equity_points: list[dict] = []
+    benchmark_points: list[dict] = []
+    history_points: list[dict] = []
     analysis_path = None
     with redirect_stdout(buffer):
         try:
@@ -890,17 +765,15 @@ def _run_analysis(
                 return _stock_fundamental_fallback(symbol, market, period, exc, use_ai, username=username)
             raise
         analysis_path = visualizer.plot_analysis(result["df"], result["symbol"], save=True)
-        from datetime import datetime
         if analysis_path:
             src = Path(analysis_path)
             if src.exists():
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 safe_symbol = result["symbol"].replace("-", "_")
-                safe_user = _safe_username(username) if username else "guest"
+                safe_user = _safe_username(username)
                 unique_path = REPORTS_DIR / f"{safe_user}_{safe_symbol}_{result['market']}_{period}_{stamp}_analysis.png"
                 shutil.copy2(src, unique_path)
                 analysis_path = str(unique_path)
-        equity_path = None
         if result.get("backtest"):
             equity_curve = result["backtest"].equity_curve.dropna()
             equity_points = [
@@ -911,7 +784,7 @@ def _run_analysis(
                 equity_points,
                 agent.config["backtest"]["initial_cash"],
                 result["backtest"].total_return,
-                "绛栫暐",
+                "strategy",
             )
         if result.get("benchmark"):
             benchmark_curve = result["benchmark"].equity_curve.dropna()
@@ -923,36 +796,49 @@ def _run_analysis(
                 benchmark_points,
                 agent.config["backtest"]["initial_cash"],
                 result["benchmark"].total_return,
-                "涔板叆鎸佹湁",
+                "benchmark",
             )
+        history_points = [
+            {
+                "date": idx.strftime("%Y-%m-%d"),
+                "close": _json_number(row.get("close")),
+                "ma20": _json_number(row.get("MA20")),
+                "ma60": _json_number(row.get("MA60")),
+                "rsi": _json_number(row.get("RSI"), 2),
+            }
+            for idx, row in result["df"].iterrows()
+        ]
 
     latest_price = result["df"]["close"].iloc[-1] if not result["df"].empty else ""
     data_start = result["df"].index.min().strftime("%Y-%m-%d") if not result["df"].empty else "-"
     data_end = result["df"].index.max().strftime("%Y-%m-%d") if not result["df"].empty else "-"
+    unit_label = _display_unit_label(result["market"], result["symbol"], data_end)
+    valuation = result.get("valuation") or {}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    summary = _build_search_summary(result, result["df"])
     analysis_result = {
         "symbol": result["symbol"],
         "market": result["market"],
+        "market_label": MARKET_LABELS.get(result["market"], result["market"]),
+        "display_name": _display_security_name(result["symbol"], result["market"], valuation),
+        "unit_label": unit_label,
         "period": period,
         "latest_price": f"{latest_price:.4f}" if latest_price != "" else "",
-        "data_range": f"{data_start} 鑷?{data_end}",
+        "data_range": f"{data_start} 至 {data_end}",
         "data_points": len(result["df"]),
+        "generated_at": now,
         "log": buffer.getvalue(),
         "analysis_image": _to_image_url(analysis_path),
-        "equity_image": _to_image_url(equity_path),
+        "equity_image": None,
         "equity_points": equity_points,
         "benchmark_points": benchmark_points,
+        "history_points": history_points,
+        "valuation": valuation,
+        "watchlist_item": _watchlist_valuation_payload(result["symbol"], result["market"], valuation, summary),
+        "summary": summary,
     }
-    standard_report = build_report_from_analysis(
-        analysis_result,
-        source_records=_analysis_source_records(analysis_result, username=username),
-    )
-    _save_standard_research_report(standard_report, username=username)
-    analysis_result["standard_report_id"] = standard_report["id"]
-    analysis_result["standard_report_url"] = "/research_report"
-
-    from datetime import datetime
     _write_history_item({
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "time": now[:16],
         "symbol": analysis_result["symbol"],
         "market": analysis_result["market"],
         "period": analysis_result["period"],
@@ -961,435 +847,314 @@ def _run_analysis(
         "data_range": analysis_result["data_range"],
         "data_points": analysis_result["data_points"],
         "analysis_image": analysis_result["analysis_image"],
-        "standard_report_id": analysis_result["standard_report_id"],
     }, username=username)
-
     return analysis_result
 
 
-def _friendly_error(exc: Exception) -> str:
-    message = str(exc).strip() or "操作失败"
-    if "fund" in message.lower():
-        return f"{message}。请检查代码是否正确，或稍后再试。"
-    if any(key in message for key in (
-        "A鑲℃暟鎹簮杩炴帴澶辫触",
-        "璇锋眰涓滄柟璐㈠瘜 API 澶辫触",
-        "API 杩斿洖閿欒",
-        "ProxyError",
-        "Unable to connect to proxy",
-        "Remote end closed connection",
-        "Max retries exceeded",
-        "HTTPSConnectionPool",
-    )):
-        return "Data source connection failed. This is usually a temporary network or proxy issue."
-    return f"操作失败：{message}"
+def _parse_natural_language_command(text: str) -> dict:
+    raw = (text or "").strip()
+    lowered = raw.lower()
+    if any(key in raw for key in ("分析", "看看", "诊断", "研究", "analyze", "report")):
+        market = ""
+        if any(key in lowered for key in ("btc", "eth", "crypto", "比特币", "以太坊")):
+            market = "crypto"
+        elif any(key in lowered for key in ("us", "nvda", "aapl", "tsla", "美股")):
+            market = "us_stock"
+        elif "基金" in raw:
+            market = "fund"
+        elif "a股" in raw or "股票" in raw:
+            market = "a_stock"
 
+        period = "max"
+        for candidate in ("1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "10y", "20y", "50y", "max"):
+            if candidate in lowered:
+                period = candidate
+                break
 
-def _fetch_latest_snapshot(symbol: str, market: str, period: str = "3mo") -> dict | None:
-    try:
-        df = agent.data_fetcher.fetch(symbol=symbol, market=market, period=period)
-        df = add_all_indicators(df, config=agent.config.get("strategy"))
-        latest = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) > 1 else latest
-        return {
-            "symbol": symbol,
-            "market": market,
-            "price": float(latest["close"]),
-            "ma_fast": float(latest.get("MA10", latest["close"])),
-            "ma_slow": float(latest.get("MA30", latest["close"])),
-            "prev_price": float(prev["close"]),
-            "prev_ma_fast": float(prev.get("MA10", prev["close"])),
-            "prev_ma_slow": float(prev.get("MA30", prev["close"])),
-            "signals": generate_signal_summary(df),
-        }
-    except Exception:
-        return None
-
-
-def _evaluate_alerts(username: str | None = None) -> list[str]:
-    username = username or _current_user()
-    if not username:
-        return []
-    alerts = _read_alerts(username=username)
-    triggered_messages = []
-    changed = False
-    for alert in alerts:
-        if not alert.get("enabled", True):
-            continue
-        snapshot = _fetch_latest_snapshot(alert.get("symbol", ""), alert.get("market", "fund"), period="3mo")
-        if not snapshot:
-            continue
-        price = snapshot["price"]
-        target = float(alert.get("target_price", 0) or 0)
-        condition = alert.get("condition", "lte")
-        hit = (condition == "lte" and price <= target) or (condition == "gte" and price >= target)
-        if hit:
-            already = alert.get("last_triggered_at")
-            direction = "低于" if condition == "lte" else "高于"
-            message = f"价格预警触发：{alert.get('symbol', '')} 当前价 {price:.4f}，已{direction}目标价 {target:.4f}"
-            if not already:
-                alert["last_triggered_at"] = datetime.now().isoformat()
-                triggered_messages.append(message)
-                _push_notification(message, username=username, level="alert")
-                changed = True
-        else:
-            if alert.get("last_triggered_at"):
-                alert["last_triggered_at"] = ""
-                changed = True
-    if changed:
-        _write_alerts(alerts, username=username)
-    return triggered_messages
-
-
-def _evaluate_moving_average_breaks(username: str) -> list[str]:
-    mgr = HoldingsManager(filepath=str(_user_file(username, "holdings.json")), username=_safe_username(username))
-    messages = []
-    for holding in mgr.list_all():
-        snapshot = _fetch_latest_snapshot(holding.symbol, holding.market, period="3mo")
-        if not snapshot:
-            continue
-        crossed_up = snapshot["prev_price"] <= snapshot["prev_ma_fast"] and snapshot["price"] > snapshot["ma_fast"]
-        crossed_down = snapshot["prev_price"] >= snapshot["prev_ma_fast"] and snapshot["price"] < snapshot["ma_fast"]
-        if crossed_up:
-            messages.append(f"{holding.symbol} crossed above MA10 at {snapshot['price']:.4f}")
-        elif crossed_down:
-            messages.append(f"{holding.symbol} crossed below MA10 at {snapshot['price']:.4f}")
-    for msg in messages:
-        _push_notification(f"MA alert: {msg}", username=username, level="info")
-    return messages
-
-
-def _run_daily_holdings_scan(username: str) -> None:
-    mgr = HoldingsManager(filepath=str(_user_file(username, "holdings.json")), username=_safe_username(username))
-    summary = []
-    for holding in mgr.list_all():
-        try:
-            analysis = _run_analysis(
-                holding.symbol,
-                holding.market,
-                "max",
-                use_ai=False,
-                force_refresh=False,
-                username=username,
-            )
-            summary.append({
-                "symbol": holding.symbol,
-                "market": holding.market,
-                "price": analysis.get("latest_price") or "-",
-                "data_points": analysis.get("data_points", 0),
-                "analysis_image": analysis.get("analysis_image"),
-                "status": "ok",
-            })
-        except Exception as exc:
-            snapshot = _fetch_latest_snapshot(holding.symbol, holding.market, period="1y")
-            item = {
-                "symbol": holding.symbol,
-                "market": holding.market,
-                "status": "snapshot" if snapshot else "error",
+        symbol = ""
+        code_match = re.search(r"\b[A-Z]{2,10}(?:-[A-Z]{2,10})?\b", raw.upper())
+        if code_match:
+            symbol = code_match.group(0)
+        digit_match = re.search(r"\b\d{6}\b", raw)
+        if digit_match:
+            symbol = digit_match.group(0)
+        if symbol:
+            return {
+                "intent": "analyze",
+                "symbol": symbol,
+                "market": market or "auto",
+                "period": period,
+                "use_ai": "ai" in lowered or "报告" in raw,
             }
-            if snapshot:
-                item.update({"price": round(snapshot["price"], 4), "signals": snapshot["signals"]})
-            else:
-                item["error"] = str(exc)
-            summary.append(item)
-    if summary:
-        _append_automation_log(username, {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "type": "daily_holdings_scan",
-            "summary": summary,
-        })
-        _push_notification(f"Daily holdings scan completed for {len(summary)} symbols.", username=username, level="info")
-
-
-def _run_daily_digest(username: str) -> None:
-    history = _read_history(username=username, limit=5)
-    latest_symbols = [item.get("symbol", "") for item in history[:3] if item.get("symbol")]
-    _append_automation_log(username, {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "type": "daily_digest",
-        "summary": {
-            "recent_symbols": latest_symbols,
-            "history_count": len(_read_history(username=username, limit=100)),
-            "alert_count": len(_read_alerts(username=username)),
-        },
-    })
-    _push_notification("Daily digest generated.", username=username, level="info")
-
-
-def _automation_job_runner(username: str, job_type: str) -> None:
-    try:
-        app.logger.info("automation job started: user=%s job=%s", username, job_type)
-        if job_type == "price_alert_scan":
-            hits = _evaluate_alerts(username=username)
-            ma_hits = _evaluate_moving_average_breaks(username)
-            _append_automation_log(username, {
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "type": job_type,
-                "summary": {"price_alert_hits": hits, "ma_hits": ma_hits},
-            })
-        elif job_type == "daily_holdings_scan":
-            _run_daily_holdings_scan(username)
-        elif job_type == "daily_digest":
-            _run_daily_digest(username)
-        elif job_type == "market_daily_report":
-            _run_market_report(username, "daily")
-        elif job_type == "market_weekly_report":
-            _run_market_report(username, "weekly")
-        elif job_type == "system_maintenance":
-            _run_system_maintenance(username)
-        elif job_type == "max_history_refresh":
-            _run_max_history_refresh(username)
-        app.logger.info("automation job finished: user=%s job=%s", username, job_type)
-    except Exception as exc:
-        app.logger.exception("automation job failed: user=%s job=%s", username, job_type)
-        _append_automation_log(username, {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "type": job_type,
-            "summary": {"error": str(exc)},
-        })
-
-
-def _scheduler_event_listener(event) -> None:
-    job_id = getattr(event, "job_id", "unknown")
-    if event.code == EVENT_JOB_MISSED:
-        app.logger.warning("scheduler missed job: %s", job_id)
-    elif event.code == EVENT_JOB_ERROR:
-        app.logger.error("scheduler job error: %s %s", job_id, getattr(event, "exception", ""))
-
-
-def _reload_user_jobs(username: str) -> None:
-    username = _safe_username(username)
-    for job in scheduler.get_jobs():
-        if job.id.startswith(f"{username}:"):
-            scheduler.remove_job(job.id)
-    for item in _read_automations(username=username):
-        if not item.get("enabled", True):
-            continue
-        job_type = item.get("job_type")
-        if job_type in ("price_alert_scan", "system_maintenance", "max_history_refresh"):
-            default_minutes = 1440 if job_type == "max_history_refresh" else (60 if job_type == "system_maintenance" else 15)
-            minutes = _bounded_int(item.get("interval_minutes", default_minutes), default_minutes, 1, 10080)
-            scheduler.add_job(
-                _automation_job_runner,
-                "interval",
-                minutes=minutes,
-                id=f"{username}:{item['id']}",
-                replace_existing=True,
-                kwargs={"username": username, "job_type": job_type},
-            )
-        elif job_type == "market_weekly_report":
-            run_time = _normalize_run_time(item.get("run_time", "16:30"), default="16:30")
-            hour, minute = [int(x) for x in run_time.split(":", 1)]
-            scheduler.add_job(
-                _automation_job_runner,
-                "cron",
-                day_of_week="fri",
-                hour=hour,
-                minute=minute,
-                id=f"{username}:{item['id']}",
-                replace_existing=True,
-                kwargs={"username": username, "job_type": job_type},
-            )
-        else:
-            run_time = _normalize_run_time(item.get("run_time", "09:00"))
-            hour, minute = [int(x) for x in run_time.split(":", 1)]
-            scheduler.add_job(
-                _automation_job_runner,
-                "cron",
-                hour=hour,
-                minute=minute,
-                id=f"{username}:{item['id']}",
-                replace_existing=True,
-                kwargs={"username": username, "job_type": job_type},
-            )
-
-
-def _reload_all_jobs() -> None:
-    USERSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    for user_dir in USERSPACE_DIR.iterdir():
-        if user_dir.is_dir():
-            _reload_user_jobs(user_dir.name)
-
-
-def _current_holdings_dataframe() -> list[dict]:
-    mgr = _current_holdings_mgr()
-    return [
-        {
-            "username": _safe_username(_current_user()),
-            "symbol": h.symbol,
-            "market": h.market,
-            "quantity": h.quantity,
-            "avg_cost": h.avg_cost,
-            "buy_date": h.buy_date,
-            "notes": h.notes,
-            "added_at": h.added_at,
-        }
-        for h in mgr.list_all()
-    ]
-
-
-def _export_rows_to_files(rows: list[dict], stem: str, username: str | None = None):
-    username = username or _current_user()
-    export_dir = _user_dir(username) / "exports"
-    safe_stem = safe_export_stem(stem)
-    unique_stem = f"{safe_stem}_{uuid4().hex[:10]}"
-    return build_export_files(rows, unique_stem, export_dir)
-
-
-def _send_user_export(path: Path, username: str):
-    export_dir = (_user_dir(username) / "exports").resolve()
-    resolved = path.resolve()
-    if export_dir not in resolved.parents:
-        return "Not found", 404
-    return send_file(resolved, as_attachment=True)
+    return {"intent": "unknown", "reply": "没有识别到请求。可以输入：分析 002982 基金，或 analyze NVDA 1mo。"}
 
 
 def _handle_prompt(prompt: str) -> tuple[dict | None, str | None, str | None, dict]:
-    parsed = parse_natural_language_command(prompt, agent)
+    parsed = _parse_natural_language_command(prompt)
     wants_ai = any(k in prompt.lower() for k in ("ai", "llm", "report"))
-    form = {
-        "prompt": prompt,
-        "symbol": "",
-        "market": "fund",
-        "period": "max",
-        "use_ai": wants_ai,
-    }
-
-    intent = parsed.get("intent")
-    if intent == "analyze":
-        market = _normalize_market(parsed.get("market") or "fund")
-        symbol = _normalize_symbol(parsed.get("symbol") or "", market)
+    form = _default_form()
+    form.update({"prompt": prompt, "use_ai": wants_ai})
+    if parsed.get("intent") == "analyze":
+        market = _normalize_market(parsed.get("market") or "auto")
+        symbol, market = _resolve_search_symbol(parsed.get("symbol") or "", market)
         period = _normalize_period(parsed.get("period") or "max")
         use_ai = bool(parsed.get("use_ai", False) and wants_ai)
         form.update({"symbol": symbol, "market": market, "period": period, "use_ai": use_ai})
         return _run_analysis(symbol, market, period, use_ai), None, None, form
-
-    if intent == "holdings":
-        username = _current_user()
-        if not username:
-            return None, "请先登录后再查看持仓。", None, form
-        holdings = _current_holdings_mgr().list_all()
-        if not holdings:
-            return None, "暂无持仓。", None, form
-        lines = ["当前持仓："]
-        for h in holdings:
-            lines.append(f"- {h.symbol} ({h.market}) qty:{h.quantity} cost:{h.avg_cost}")
-        return None, "\n".join(lines), None, form
-
-    if intent == "help":
-        return None, "Try: analyze 002982 fund, analyze NVDA 1mo, or view my holdings.", None, form
-
-    if intent == "quit":
-        return None, "The web version does not need a quit command.", None, form
-
-    return None, parsed.get("reply") or "I did not recognize that request yet.", None, form
+    return None, parsed.get("reply") or "没有识别到请求。", None, form
 
 
-if not scheduler.running:
-    scheduler.add_listener(_scheduler_event_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
-    scheduler.start()
-    sqlite_store.migrate_userspace(USERSPACE_DIR)
-    _reload_all_jobs()
+def _reader_payload(version: str) -> dict:
+    presets = {
+        "个人投资者版": {
+            "note": "当前：个人投资者版",
+            "conclusion": "关注回撤、数据完整性和持仓集中度。",
+        },
+        "小资金账户版": {
+            "note": "当前：小资金账户版",
+            "conclusion": "关注仓位、承受亏损和交易成本。",
+        },
+        "业余量化版": {
+            "note": "当前：业余量化版",
+            "conclusion": "关注收益、回撤、波动和样本区间。",
+        },
+        "小型投研团队版": {
+            "note": "当前：小型投研团队版",
+            "conclusion": "关注数据来源、风险边界和复盘记录。",
+        },
+    }
+    return presets.get(version) or presets["个人投资者版"]
 
 
+def _render_analysis(result=None, note=None, error=None, form=None):
+    broker_ready = _broker_data_ready()
+    return render_template_string(
+        PAGE_TEMPLATE,
+        result=result,
+        note=note,
+        error=error,
+        form=form or _default_form(),
+        default_symbol=agent.config["market"]["default_symbol"],
+        broker_data_ready=broker_ready,
+        broker_data_source_label=_broker_data_source_label() if broker_ready else "公开行情",
+    )
 
 
-register_system_routes(app, {
-    "scheduler": scheduler,
-    "reports_dir": lambda: REPORTS_DIR,
-    "current_user": _current_user,
-    "is_report_visible_to_user": _is_report_visible_to_user,
-    "read_history": _read_history,
-    "cache_count": _cache_count,
-    "agent": agent,
-    "current_holdings_dataframe": _current_holdings_dataframe,
-    "read_alerts": _read_alerts,
-    "export_rows_to_files": _export_rows_to_files,
-    "send_user_export": _send_user_export,
-    "safe_username": _safe_username,
-})
+@app.route("/analysis", methods=["GET", "POST"])
+def analysis_page():
+    result = None
+    note = None
+    error = None
+    form = _default_form()
+    if request.method == "POST":
+        mode = request.form.get("mode", "")
+        try:
+            if mode == "analyze":
+                market = _normalize_market(request.form.get("market", "fund"))
+                symbol, market = _resolve_search_symbol(request.form.get("symbol", ""), market)
+                period = _normalize_period(request.form.get("period", "max"))
+                start_date = _normalize_backtest_date(request.form.get("start_date"), "开始日期")
+                end_date = _normalize_backtest_date(request.form.get("end_date"), "结束日期")
+                if start_date and end_date and start_date > end_date:
+                    raise ValueError("开始日期不能晚于结束日期。")
+                use_ai = request.form.get("use_ai", "false") == "true"
+                reader_version = (request.form.get("reader_version") or "个人投资者版").strip() or "个人投资者版"
+                analysis_period = "max" if (start_date or end_date) else period
+                form.update({
+                    "symbol": symbol,
+                    "market": market,
+                    "period": period,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "use_ai": use_ai,
+                    "reader_version": reader_version,
+                })
+                if not symbol:
+                    error = "请输入标的代码。"
+                else:
+                    result = _run_analysis(
+                        symbol,
+                        market,
+                        analysis_period,
+                        use_ai,
+                        start_date=start_date or None,
+                        end_date=end_date or None,
+                    )
+            elif mode == "chat":
+                prompt = (request.form.get("prompt", "") or "").strip()
+                if not prompt:
+                    error = "请输入请求内容。"
+                else:
+                    result, note, error, form = _handle_prompt(prompt)
+            else:
+                error = "Unknown request type."
+        except ValueError as exc:
+            error = str(exc)
+        except Exception as exc:
+            traceback.print_exc()
+            app.logger.exception("analysis request failed")
+            error = _friendly_error(exc)
+    return _render_analysis(result=result, note=note, error=error, form=form)
 
-register_auth_routes(app, {
-    "load_users": _load_users,
-    "save_users": _save_users,
-    "verify_password": _verify_password,
-    "hash_password": _hash_password,
-    "is_valid_username": _is_valid_username,
-    "login_blocked_until": _login_blocked_until,
-    "record_login_failure": _record_login_failure,
-    "clear_login_failures": _clear_login_failures,
-    "ensure_user_space": _ensure_user_space,
-    "reload_user_jobs": _reload_user_jobs,
-})
 
-register_research_routes(app, {
-    "agent": agent,
-    "normalize_market": _normalize_market,
-    "normalize_period": _normalize_period,
-    "normalize_symbol": _normalize_symbol,
-    "friendly_error": _friendly_error,
-    "current_user": _current_user,
-    "ensure_user_space": _ensure_user_space,
-    "normalize_run_time": _normalize_run_time,
-    "run_market_report": _run_market_report,
-    "upsert_automation_items": _upsert_automation_items,
-    "read_market_reports": _read_market_reports,
-    "read_automations": _read_automations,
-    "economic_history_events": ECONOMIC_HISTORY_EVENTS,
-    "valuation_metrics": VALUATION_METRICS,
-})
+@app.route("/")
+def index():
+    return redirect(url_for("analysis_page"))
 
-register_report_routes(app, {
-    "current_user": _current_user,
-    "ensure_user_space": _ensure_user_space,
-    "user_dir": _user_dir,
-    "safe_username": _safe_username,
-    "friendly_error": _friendly_error,
-    "read_history": _read_history,
-    "agent": agent,
-})
 
-register_main_routes(app, {
-    "current_user": _current_user,
-    "ensure_user_space": _ensure_user_space,
-    "normalize_market": _normalize_market,
-    "normalize_symbol": _normalize_symbol,
-    "normalize_period": _normalize_period,
-    "run_analysis": _run_analysis,
-    "handle_prompt": _handle_prompt,
-    "parse_bounded_float": _parse_bounded_float,
-    "validate_buy_date": _validate_buy_date,
-    "current_holdings_mgr": _current_holdings_mgr,
-    "sync_sqlite_user_data": _sync_sqlite_user_data,
-    "read_alerts": _read_alerts,
-    "write_alerts": _write_alerts,
-    "evaluate_alerts": _evaluate_alerts,
-    "read_automations": _read_automations,
-    "write_automations": _write_automations,
-    "reload_user_jobs": _reload_user_jobs,
-    "automation_job_runner": _automation_job_runner,
-    "friendly_error": _friendly_error,
-    "consume_notifications": _consume_notifications,
-    "read_history": _read_history,
-    "read_automation_log": _read_automation_log,
-    "cache_count": _cache_count,
-    "list_recent_reports": _list_recent_reports,
-    "bounded_int": _bounded_int,
-    "normalize_run_time": _normalize_run_time,
-    "user_dir": _user_dir,
-    "shared_reports_dir": lambda: DATA_DIR / "shared_reports",
-    "agent": agent,
-})
+@app.route("/reports/<path:filename>")
+def serve_report(filename: str):
+    path = (REPORTS_DIR / filename).resolve()
+    if REPORTS_DIR.resolve() not in path.parents or not path.exists():
+        return "Not found", 404
+    return send_from_directory(REPORTS_DIR, filename)
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "page": "analysis"}
+
+
+@app.route("/api/broker/status")
+def broker_status_api():
+    status = broker_adapter.status()
+    return jsonify({
+        "ok": True,
+        "enabled": status.enabled,
+        "connected": status.connected,
+        "provider": status.provider,
+        "message": status.message,
+    })
+
+
+@app.route("/api/watchlist/realtime", methods=["POST"])
+def watchlist_realtime_api():
+    payload = request.get_json(silent=True)
+    raw_items = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    refreshed = []
+    errors = []
+    for raw_item in raw_items[:30]:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_symbol = str(raw_item.get("symbol") or "").strip()
+        raw_market = str(raw_item.get("market") or "auto").strip() or "auto"
+        if not raw_symbol:
+            continue
+        try:
+            symbol, market = _resolve_search_symbol(raw_symbol, _normalize_market(raw_market))
+            df = agent.data_fetcher.fetch(symbol, market=market, period="1y", force_refresh=True)
+            df = add_all_indicators(df, config=agent.config.get("strategy"))
+            signals = generate_signal_summary(df)
+            summary = _build_search_summary({"symbol": symbol, "market": market, "signals": signals}, df)
+            valuation = fetch_stock_value(symbol, market) if market in ("us_stock", "a_stock", "fund") else None
+            item = _watchlist_valuation_payload(symbol, market, valuation, summary)
+            item["name"] = _display_security_name(symbol, market, valuation)
+            item["refreshedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            item["dataSource"] = "remote"
+            refreshed.append(item)
+        except Exception as exc:
+            errors.append({"symbol": raw_symbol, "error": _friendly_error(exc)})
+            fallback = dict(raw_item)
+            fallback["symbol"] = raw_symbol
+            fallback["conclusion"] = "实时获取失败"
+            fallback["status"] = "status-high"
+            fallback["valuationSource"] = "remote-error"
+            fallback["metricMode"] = fallback.get("metricMode") or "market"
+            fallback["error"] = _friendly_error(exc)
+            refreshed.append(fallback)
+    return jsonify({
+        "ok": True,
+        "items": refreshed,
+        "errors": errors,
+        "refreshed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+@app.route("/api/ui/report_config", methods=["POST"])
+def save_report_config_api():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    config = {
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "page": str(payload.get("page") or "/analysis")[:500],
+        "title": str(payload.get("title") or "策略研究报告")[:120],
+        "reader_version": str(payload.get("reader_version") or "个人投资者版")[:80],
+        "toggles": payload.get("toggles") if isinstance(payload.get("toggles"), dict) else {},
+        "form": payload.get("form") if isinstance(payload.get("form"), dict) else {},
+    }
+    state = _read_json_file(_user_file(_current_user(), "ui_state.json"), {})
+    state["report_config"] = config
+    _write_json_file(_user_file(_current_user(), "ui_state.json"), state)
+    return jsonify({"ok": True, "message": "已保存", "config": config})
+
+
+@app.route("/api/ui/share_link", methods=["POST"])
+def share_report_link_api():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    token = uuid4().hex[:16]
+    share_dir = DATA_DIR / "shared_reports"
+    snapshot = {
+        "token": token,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": str(payload.get("title") or "策略研究报告"),
+        "page": "/analysis",
+        "report_config": payload,
+    }
+    _write_json_file(share_dir / f"{token}.json", snapshot)
+    return jsonify({"ok": True, "share_url": url_for("analysis_page", _external=True), "snapshot": snapshot})
+
+
+@app.route("/api/ui/reader_version", methods=["POST"])
+def reader_version_api():
+    payload = request.get_json(silent=True)
+    version = str((payload or {}).get("version") or "个人投资者版")
+    data = _reader_payload(version)
+    return jsonify({"ok": True, "version": version, **data})
+
+
+@app.route("/api/ui/explain")
+def explain_metric_api():
+    name = (request.args.get("name") or "").strip()
+    explanations = {
+        "年化收益": "把区间收益换算为一年维度后的收益率，用于比较不同周期表现。",
+        "超额收益": "策略收益减去基准收益后的差额，用来观察是否跑赢基准。",
+        "夏普比率": "单位波动带来的收益质量参考，数值越高通常表示风险调整后表现越好。",
+        "最大回撤": "从历史高点跌到后续低点的最大跌幅，用于衡量最差持有体验。",
+        "胜率": "盈利周期占全部统计周期的比例，不能单独代表策略好坏。",
+        "跟踪误差": "策略相对基准收益差的波动程度，越高说明偏离基准越明显。",
+    }
+    explanation = explanations.get(name) or f"{name} 是当前分析页中的报告字段，用于辅助理解收益、风险、因子有效性或报告口径。"
+    return jsonify({"ok": True, "name": name, "explanation": explanation})
+
+
+@app.route("/api/report_followup", methods=["POST"])
+def report_followup_api():
+    question = (request.form.get("question") or "").strip()
+    context = (request.form.get("context") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "error": "请输入追问内容。"}), 400
+    if agent.llm:
+        try:
+            answer = agent.llm.chat(
+                "你是投资复盘与风险分析报告助手。保持观察、复核、风险提示口径，不给下单指令。",
+                f"报告上下文：\n{context[:3000]}\n\n用户问题：{question}",
+            ).strip()
+        except Exception:
+            answer = ""
+        if answer:
+            return jsonify({"ok": True, "answer": answer, "history": []})
+    fallback = "可以继续追问。当前最值得复核的是：数据是否完整、回撤是否扩大、持仓是否集中、交易成本是否影响收益。"
+    return jsonify({"ok": True, "answer": fallback, "history": []})
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5001"))
     host = os.getenv("HOST", "127.0.0.1")
     if sys.stdout:
-        print(f"Web console started: http://{host}:{port}")
+        print(f"Analysis page started: http://{host}:{port}/analysis")
     app.run(host=host, port=port, debug=False)
-
-
-
-
-

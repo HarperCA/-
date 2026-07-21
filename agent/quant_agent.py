@@ -17,10 +17,6 @@ from core.backtest import BacktestEngine
 from core.fund_manager import fetch_fund_manager, format_manager_report
 from core.value_analysis import fetch_stock_value, format_value_report
 from agent.llm_client import LLMClient
-from trading.paper_trading import PaperTrader
-from trading.risk_manager import RiskManager, RiskConfig
-from trading.strategy_signals import generate_composite_signal, signal_to_action
-from trading.order import OrderSide
 
 configure_console_output()
 
@@ -58,21 +54,8 @@ class QuantAgent:
             self.llm = None
             print("[提示] 未配置大模型 API Key，AI 分析功能将不可用。")
 
-        # 初始化模拟盘（按需）
+        # This report-only build intentionally disables paper trading.
         self.paper_trader = None
-        if paper_trade:
-            risk_cfg = RiskConfig(
-                max_position_pct=0.25,
-                stop_loss_pct=0.07,
-                take_profit_pct=0.15,
-                max_drawdown_pct=0.10,
-            )
-            self.paper_trader = PaperTrader(
-                initial_cash=self.config["backtest"]["initial_cash"],
-                commission_rate=self.config["backtest"]["commission"],
-                risk_manager=RiskManager(risk_cfg),
-            )
-            print("📋 模拟盘已启动，初始资金:", self.paper_trader.portfolio.initial_cash)
 
     def analyze(
         self,
@@ -221,15 +204,10 @@ class QuantAgent:
         print(self._format_cross_asset_valuation(market, val_data))
 
         # 观察信号与风险复核口径
-        signal, sub_signals = generate_composite_signal(df)
+        signal = self.generate_trade_signal(df)
         current_position = 0
-        if self.paper_trader:
-            pos = self.paper_trader.portfolio.get_position(symbol)
-            current_position = pos.quantity if pos else 0
-
-        action = signal_to_action(signal, current_position)
+        action = "observe_strong" if signal == 1 else "observe_risk" if signal == -1 else "observe_neutral"
         print(f"\n💡 程序观察信号: {signal} ({action})")
-        print(f"   子信号详情: {sub_signals}")
 
         # 复核融合：程序观察信号 + AI观察信号 + 风控 → 观察结论
         final_decision = self._fusion_decision(
@@ -249,11 +227,7 @@ class QuantAgent:
         print(f"  观察结论: {final_decision['操作建议']}")
         print("=" * 50)
 
-        # 模拟盘执行仅保留给显式开启 paper_trade 的实验场景；产品默认不触发实盘或自动交易。
-        if self.paper_trader and final_decision["执行信号"] != 0:
-            self._execute_paper_trade(symbol, final_decision["执行信号"], df["close"].iloc[-1])
-            print("\n" + self.paper_trader.get_trade_summary())
-
+        result["valuation"] = val_data or {}
         return result
 
     def _format_fundamentals_for_ai(self, market: str, val_data=None) -> str:
@@ -399,31 +373,8 @@ class QuantAgent:
         }
 
     def _execute_paper_trade(self, symbol: str, signal: int, price: float):
-        """根据信号在模拟盘执行交易；仅用于显式开启的实验模式。"""
-        if not self.paper_trader:
-            return
-        pt = self.paper_trader
-        pos = pt.portfolio.get_position(symbol)
-        current_qty = pos.quantity if pos else 0
-
-        # 先更新价格
-        pt.update_prices({symbol: price})
-
-        # 风控检查持仓风险
-        pt.run_risk_check()
-
-        if signal == 1 and current_qty == 0:
-            # 计算可买入数量（单标仓位不超过25%）
-            max_value = pt.portfolio.total_value * pt.risk.config.max_position_pct
-            qty = int(max_value / price / 100) * 100  # A股按手取整，美股直接取整
-            if qty <= 0:
-                qty = int(max_value / price)
-            if qty > 0:
-                pt.submit_order(symbol=symbol, side=OrderSide.BUY, quantity=qty, reason="实验观察信号:偏强")
-        elif signal == -1 and current_qty > 0:
-            pt.close_position(symbol, reason="实验观察信号:偏弱")
-        else:
-            print(f"ℹ️ 模拟盘无操作: 信号={signal}, 持仓={current_qty}")
+        """Trade execution is intentionally disabled in this report-only build."""
+        return None
 
     def generate_trade_signal(self, df: pd.DataFrame) -> int:
         """

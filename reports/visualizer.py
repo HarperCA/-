@@ -8,7 +8,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
-import os
 
 from core.console import configure_console_output
 
